@@ -67,30 +67,47 @@
 #include <linux/io_uring.h>
 #include <liburing.h>
 
+/*
+ * IORING_RECVSEND_BUNDLE is a real macro, so #ifndef works. Value verified
+ * against include/uapi/linux/io_uring.h for v6.10..v6.15: (1U << 4).
+ */
 #ifndef IORING_RECVSEND_BUNDLE
 #define IORING_RECVSEND_BUNDLE		(1U << 4)
 #endif
 
 /*
- * IORING_REGISTER_PBUF_STATUS — the numeric value differs between uapi
- * revisions. It is used only for a secondary observation, so a mismatch is
- * non-fatal: the primary verdict does not depend on it.
- * Verify with:  grep -n PBUF_STATUS /usr/include/linux/io_uring.h
+ * ---------------------------------------------------------------------
+ * IORING_REGISTER_PBUF_STATUS (opcode + struct io_uring_buf_status, v6.8)
+ * ---------------------------------------------------------------------
+ * The opcode is an ENUMERATOR inside an anonymous enum, NOT a macro. The C
+ * preprocessor never sees enumerators, so "#ifndef IORING_REGISTER_PBUF_STATUS"
+ * is unconditionally true -- on every header, old and new. An earlier revision
+ * of this file used exactly that guard around a fallback struct definition and
+ * a fallback #define; on any distro shipping post-6.8 uapi headers it failed
+ * with "error: redefinition of 'struct io_uring_buf_status'" (and the #define
+ * would have collided with the enumerator next).
+ *
+ * Lesson recorded in TRIAGE.md 2.3: never feature-test an enum constant with
+ * #ifndef. Two consequences for the design below:
+ *
+ *   1. We declare our OWN struct (poc_buf_status) with the stable uapi layout
+ *      instead of touching the header's name. Our name cannot collide.
+ *      Layout verified against io_uring_register(2):
+ *          __u32 buf_group;   (input)
+ *          __u32 head;        (output)
+ *          __u32 resv[3];
+ *
+ *   2. The opcode is injected by the build (-DPOC_PBUF_STATUS_OP=N) after a
+ *      compile-time probe that reads the value out of the installed header.
+ *      No number is hardcoded here, so nothing can drift. When the probe
+ *      finds no support, query_head() compiles to a stub and the verdict falls
+ *      back to the res-vs-capacity invariant, which needs no register call.
  */
-#ifndef IORING_REGISTER_PBUF_STATUS
-#define IORING_REGISTER_PBUF_STATUS	34
-/*
- * Both the opcode and its argument struct arrived together (v6.7), so if the
- * opcode is missing the struct is missing too. Older uapi headers
- * (e.g. linux-libc-dev 6.1) lack it; without this fallback the harness does
- * not build at all. Verified: gcc 12.2 + liburing-dev 2.3 on Debian 12.
- */
-struct io_uring_buf_status {
-	__u32	buf_group;	/* in: buffer group id */
+struct poc_buf_status {
+	__u32	buf_group;	/* in:  buffer group id */
 	__u32	head;		/* out: kernel-side bl->head */
 	__u32	resv[3];
 };
-#endif
 
 #define BGID		1u
 #define RING_ENTRIES	2u	/* power of two; real capacity = 2 slots */
@@ -112,19 +129,31 @@ static void *xzalloc(size_t n)
 	return p;
 }
 
-/* Secondary observation: ask the kernel what bl->head became. */
+/*
+ * Secondary observation: ask the kernel what bl->head became.
+ * Returns -1 when the opcode was not supplied by the build probe, in which
+ * case the caller reports "head unavailable" and relies on the primary
+ * res-vs-capacity invariant.
+ */
 static int query_head(int ring_fd, unsigned int bgid, unsigned int *head)
 {
-	struct io_uring_buf_status st;
+#ifdef POC_PBUF_STATUS_OP
+	struct poc_buf_status st;
 
 	memset(&st, 0, sizeof(st));
 	st.buf_group = bgid;
 
-	if (io_uring_register(ring_fd, IORING_REGISTER_PBUF_STATUS, &st, 1))
+	if (io_uring_register(ring_fd, POC_PBUF_STATUS_OP, &st, 1))
 		return -1;
 
 	*head = st.head;
 	return 0;
+#else
+	(void)ring_fd;
+	(void)bgid;
+	(void)head;
+	return -1;
+#endif
 }
 
 int main(int argc, char *argv[])
