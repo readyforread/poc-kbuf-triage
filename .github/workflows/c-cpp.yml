@@ -1,0 +1,432 @@
+# .github/workflows/poc-kbuf-triage.yml
+#
+# Remote verification of poc/poc_kbuf_triage.c against a real kernel.
+#
+# TWO JOBS, USE BOTH:
+#   build-and-run   fast (2-3 min). Uses the GitHub-hosted runner's own kernel.
+#                   Verdict is only meaningful if that kernel is >= 6.10;
+#                   the job says so explicitly when it is not.
+#   qemu-mainline   slow (25-60 min, TCG without KVM). Builds a kernel of your
+#                   choosing and runs the PoC inside it. THIS is the
+#                   authoritative result. Off by default; enable via the
+#                   `run_qemu` input on workflow_dispatch.
+#
+# CRITICAL: do NOT add `container:` to these jobs. Docker's default seccomp
+# profile blocks io_uring_setup(2), so the harness would fail with EPERM and
+# you would misread it as "not vulnerable". Run on the VM.
+#
+# Exit-code contract of poc_kbuf_triage:
+#   0 = reproduced (bug present)      3 = not reproduced (fixed, or path not taken)
+#   4 = inconclusive (head unknown)   1/2 = environment error
+# `0` is a SECURITY finding, not a CI failure, so jobs never fail the build on it.
+
+name: poc-kbuf-triage
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_qemu:
+        description: 'Also build a kernel and run the PoC in QEMU (slow, authoritative)'
+        type: boolean
+        default: false
+      kernel_version:
+        description: 'Kernel version for the QEMU job (e.g. 6.12, 6.15.4)'
+        type: string
+        default: '6.12'
+      hardening:
+        description: 'Build the QEMU kernel with KASAN + KMEMLEAK + lockdep'
+        type: boolean
+        default: true
+  push:
+    paths:
+      - 'poc/poc_kbuf_triage.c'
+      - '.github/workflows/poc-kbuf-triage.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: poc-kbuf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  POC_SRC: poc/poc_kbuf_triage.c
+
+jobs:
+  # ==========================================================================
+  build-and-run:
+    name: Build + run on runner kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report kernel and io_uring surface
+        id: env
+        run: |
+          set -uo pipefail
+          KREL="$(uname -r)"
+          echo "kernel_release=$KREL" | tee -a "$GITHUB_OUTPUT"
+
+          KNUM="$(echo "$KREL" | grep -oE '^[0-9]+\.[0-9]+' || echo 0.0)"
+          MAJ="${KNUM%%.*}"; MIN="${KNUM##*.}"
+          if [ "$MAJ" -gt 6 ] || { [ "$MAJ" -eq 6 ] && [ "$MIN" -ge 10 ]; }; then
+            BUNDLE=1
+          else
+            BUNDLE=0
+          fi
+          echo "has_bundle=$BUNDLE" | tee -a "$GITHUB_OUTPUT"
+          echo "kernel_num=$KNUM"    | tee -a "$GITHUB_OUTPUT"
+
+          echo "--- io_uring availability ---"
+          # NOT in a container: the VM kernel is used directly.
+          if [ -r /proc/sys/kernel/io_uring_disabled ]; then
+            echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled)"
+            # 0 = unrestricted. If the image ships non-zero, relax it: an
+            # unprivileged user must be able to create a ring for this test.
+            if [ "$(cat /proc/sys/kernel/io_uring_disabled)" != "0" ]; then
+              sudo sysctl -w kernel.io_uring_disabled=0 || true
+            fi
+          else
+            echo "io_uring_disabled sysctl absent (kernel < 6.6)"
+          fi
+          echo "running as: $(id -un) (uid $(id -u)) - unprivileged is intended"
+          grep -c . /proc/kallsyms >/dev/null 2>&1 || true
+          if grep -q io_uring_setup /proc/kallsyms 2>/dev/null; then
+            echo "io_uring_setup symbol: present"
+          else
+            echo "io_uring_setup symbol: not visible (kallsyms may be restricted)"
+          fi
+
+          if [ "$BUNDLE" = "0" ]; then
+            echo "::warning title=Kernel too old::runner kernel $KREL < 6.10: IORING_RECVSEND_BUNDLE is unavailable, so io_ring_buffers_peek() cannot be reached. Any 'not reproduced' result from this job is INCONCLUSIVE, not FIXED. Enable the qemu-mainline job."
+          fi
+
+      - name: Install liburing
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends liburing-dev
+          dpkg -s liburing-dev | grep -E '^(Package|Version):'
+          echo "--- uapi constants present in installed headers? ---"
+          for c in IORING_RECVSEND_BUNDLE IORING_REGISTER_PBUF_STATUS io_uring_buf_status; do
+            if grep -rq "$c" /usr/include/ 2>/dev/null; then
+              echo "  $c: defined by system headers"
+            else
+              echo "  $c: NOT in system headers -> PoC uses its #ifndef fallback"
+            fi
+          done
+
+      - name: Compile (warnings are treated as defects)
+        run: |
+          gcc -O2 -Wall -Wextra -Werror -o poc_kbuf_triage "$POC_SRC" -luring
+          echo "compiled clean with -Wall -Wextra -Werror"
+          # also exercise the strict pass, informational only
+          gcc -O2 -Wall -Wextra -Wformat=2 -Wshadow -c "$POC_SRC" -o /tmp/strict.o || true
+
+      - name: Run tail-delta (finding 2, UNVALIDATED_TAIL_DELTA)
+        id: taildelta
+        run: |
+          set +e
+          ./poc_kbuf_triage tail-delta 2>&1 | tee tail-delta.log
+          echo "exit_code=${PIPESTATUS[0]}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Run zero-len (finding 8, ZERO_LEN_BUFFER_IN_LOOP)
+        id: zerolen
+        run: |
+          set +e
+          ./poc_kbuf_triage zero-len 2>&1 | tee zero-len.log
+          echo "exit_code=${PIPESTATUS[0]}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Parameter sweep (reachability-chain sanity)
+        id: sweep
+        run: |
+          set +e
+          # sqe->len = 0 must NOT reproduce: link 2 of the chain in TRIAGE.md 2.1.
+          # If this DOES reproduce, the model in TRIAGE.md is wrong.
+          # NOTE: PIPESTATUS must be consumed in this same step; it does not
+          # survive across steps, hence the dedicated output.
+          ./poc_kbuf_triage tail-delta 0 2>&1 | tee sweep-len0.log
+          echo "exit_code=${PIPESTATUS[0]}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Classify
+        id: classify
+        run: |
+          BUNDLE="${{ steps.env.outputs.has_bundle }}"
+          TD="${{ steps.taildelta.outputs.exit_code }}"
+          ZL="${{ steps.zerolen.outputs.exit_code }}"
+          SW="${{ steps.sweep.outputs.exit_code }}"
+
+          if [ "$BUNDLE" != "1" ]; then
+            VERDICT="INCONCLUSIVE_KERNEL_TOO_OLD"
+          elif [ "$TD" = "0" ] || [ "$ZL" = "0" ]; then
+            VERDICT="REPRODUCED"
+          elif [ "$TD" = "3" ] && [ "$ZL" = "3" ]; then
+            VERDICT="NOT_REPRODUCED"
+          elif [ "$TD" = "1" ] || [ "$TD" = "2" ]; then
+            VERDICT="ENV_ERROR"
+          else
+            VERDICT="INCONCLUSIVE"
+          fi
+          echo "verdict=$VERDICT" | tee -a "$GITHUB_OUTPUT"
+
+          # The sweep is a CONTROL, not a variant: with sqe->len=0 the peek path
+          # must collapse to a single iovec and NOT reproduce. If it does
+          # reproduce, our understanding of the reachability chain is wrong and
+          # every other result in this run is untrustworthy.
+          if [ "$BUNDLE" = "1" ] && [ "$SW" = "0" ]; then
+            echo "::error title=Control failed::sqe_len=0 reproduced the bug (exit 0). The reachability model in TRIAGE.md 2.1 is wrong; do not trust the other verdicts in this run."
+          fi
+
+          {
+            echo "## poc-kbuf-triage: \`$VERDICT\`"
+            echo
+            echo "| item | value |"
+            echo "|---|---|"
+            echo "| runner kernel | \`${{ steps.env.outputs.kernel_release }}\` |"
+            echo "| >= 6.10 (bundle support) | $([ "$BUNDLE" = "1" ] && echo yes || echo '**NO — result inconclusive**') |"
+            echo "| tail-delta exit | $TD |"
+            echo "| zero-len exit | $ZL |"
+            echo "| control (sqe_len=0, must be 3) | $SW |"
+            echo
+            echo "Exit codes: \`0\`=reproduced, \`3\`=not reproduced, \`4\`=inconclusive, \`1/2\`=env error."
+            echo
+            echo "> A \`NOT_REPRODUCED\` on a kernel < 6.10 means nothing. Run the"
+            echo "> \`qemu-mainline\` job for an authoritative answer."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: poc-kbuf-logs-runner
+          path: |
+            tail-delta.log
+            zero-len.log
+            sweep-len0.log
+          if-no-files-found: warn
+
+  # ==========================================================================
+  qemu-mainline:
+    name: Build kernel ${{ inputs.kernel_version || '6.12' }} + run in QEMU
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_qemu }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential flex bison bc libelf-dev libssl-dev \
+            cpio kmod busybox-static qemu-system-x86 liburing-dev
+          nproc; free -h; qemu-system-x86_64 --version | head -1
+
+      - name: Fetch kernel ${{ inputs.kernel_version || '6.12' }}
+        run: |
+          set -e
+          KV="${{ inputs.kernel_version }}"
+          KV="${KV:-6.12}"
+          SERIES="$(echo "$KV" | cut -d. -f1,2)"
+          URL="https://cdn.kernel.org/pub/linux/kernel/v${SERIES%%.*}.x/linux-${KV}.tar.xz"
+          echo "downloading $URL"
+          curl -fsSL -o linux.tar.xz "$URL" || {
+            echo "::error::download failed; check that $KV is a released stable version"
+            exit 1
+          }
+          tar xf linux.tar.xz
+          mv "linux-${KV}" linux
+          echo "src_dir=linux" >> "$GITHUB_ENV"
+
+      - name: Configure kernel
+        run: |
+          set -e
+          cd linux
+          make defconfig
+
+          # --- required for the PoC ---
+          ./scripts/config --enable CONFIG_IO_URING
+          ./scripts/config --enable CONFIG_NET
+          ./scripts/config --enable CONFIG_UNIX
+          ./scripts/config --enable CONFIG_INET
+
+          # --- make it boot fast and headless ---
+          ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
+          ./scripts/config --disable SYSTEM_TRUSTED_KEYS
+          ./scripts/config --disable SYSTEM_REVOCATION_KEYS
+          ./scripts/config --set-str  CONFIG_LOCALVERSION "-poctriage"
+
+          # --- hardening: turns a silent corruption into a loud report ---
+          if [ "${{ inputs.hardening }}" = "true" ]; then
+            ./scripts/config --enable  CONFIG_KASAN
+            ./scripts/config --enable  CONFIG_KASAN_INLINE
+            ./scripts/config --enable  CONFIG_DEBUG_KMEMLEAK
+            ./scripts/config --enable  CONFIG_DEBUG_KMEMLEAK_AUTO_SCAN
+            ./scripts/config --enable  CONFIG_PROVE_LOCKING
+            ./scripts/config --enable  CONFIG_LOCKDEP
+            ./scripts/config --enable  CONFIG_DEBUG_ATOMIC_SLEEP
+            ./scripts/config --enable  CONFIG_DEBUG_LIST
+            ./scripts/config --enable  CONFIG_UBSAN
+            ./scripts/config --disable CONFIG_UBSAN_TRAP
+            # keep slab traces readable
+            ./scripts/config --disable CONFIG_SLAB_FREELIST_HARDENED
+            ./scripts/config --disable CONFIG_INIT_ON_FREE_DEFAULT_ON
+          fi
+
+          make olddefconfig
+          echo "--- effective config ---"
+          grep -E '^CONFIG_(IO_URING|KASAN|DEBUG_KMEMLEAK|PROVE_LOCKING|UBSAN)=' .config || true
+
+      - name: Build kernel
+        run: |
+          cd linux
+          make -j"$(nproc)" bzImage 2>&1 | tail -25
+          ls -la arch/x86/boot/bzImage
+
+      - name: Build PoC statically
+        run: |
+          set -e
+          gcc -O2 -Wall -Wextra -static -o poc_static "$POC_SRC" -luring
+          file poc_static
+          ldd poc_static 2>&1 | head -3 || true   # expected: "not a dynamic executable"
+
+      - name: Assemble initramfs
+        run: |
+          set -e
+          rm -rf initramfs && mkdir -p initramfs/{bin,proc,sys,dev,tmp}
+          cp /bin/busybox initramfs/bin/busybox
+          for applet in sh mount umount poweroff reboot cat echo grep tail \
+                        dmesg uname sysctl ls mkdir sleep; do
+            ln -sf busybox "initramfs/bin/$applet"
+          done
+          cp poc_static initramfs/bin/poc
+
+          cat > initramfs/init <<'INIT'
+          #!/bin/busybox sh
+          /bin/busybox mount -t proc     proc /proc
+          /bin/busybox mount -t sysfs    sys  /sys
+          /bin/busybox mount -t devtmpfs dev  /dev 2>/dev/null
+          # debugfs is REQUIRED for the kmemleak negative test below; without
+          # this mount the scan silently degrades to the fallback message and
+          # you lose the ability to distinguish "no leak" from "never checked".
+          /bin/busybox mkdir -p /sys/kernel/debug
+          /bin/busybox mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || \
+            echo "(debugfs mount failed - CONFIG_DEBUG_FS off?)"
+
+          echo "=====POC-TRIAGE-BEGIN====="
+          echo "kernel: $(/bin/busybox uname -r)"
+          echo "io_uring_disabled: $(/bin/busybox cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo n/a)"
+
+          for m in tail-delta zero-len; do
+            echo "-----MODE:$m-----"
+            /bin/poc "$m"
+            echo "-----EXIT:$m:$?-----"
+          done
+
+          # reachability-chain control: sqe->len=0 must NOT reproduce
+          echo "-----MODE:sweep-len0-----"
+          /bin/poc tail-delta 0
+          echo "-----EXIT:sweep-len0:$?-----"
+
+          # Negative test for finding 1: prove KMEMLEAK is alive and that the
+          # -EFAULT path produces no report. The dump is printed so the result is
+          # auditable from the console log rather than inferred from silence.
+          echo "-----KMEMLEAK-SCAN-----"
+          if [ -w /sys/kernel/debug/kmemleak ]; then
+            echo scan > /sys/kernel/debug/kmemleak
+            /bin/busybox sleep 3
+            echo "-----KMEMLEAK-OUTPUT-BEGIN-----"
+            /bin/busybox cat /sys/kernel/debug/kmemleak
+            echo "-----KMEMLEAK-OUTPUT-END-----"
+          else
+            echo "(kmemleak unavailable: CONFIG_DEBUG_KMEMLEAK off or debugfs missing)"
+          fi
+
+          echo "-----DMESG-TAIL-----"
+          /bin/busybox dmesg | /bin/busybox tail -80
+          echo "=====POC-TRIAGE-END====="
+          sync
+          /bin/busybox poweroff -f
+          INIT
+          chmod +x initramfs/init
+
+          (cd initramfs && find . | cpio -o -H newc 2>/dev/null | gzip -9 > ../initramfs.cpio.gz)
+          ls -la initramfs.cpio.gz
+
+      - name: Run under QEMU
+        run: |
+          set +e
+          KVM=""
+          if [ -e /dev/kvm ]; then
+            echo "/dev/kvm present -> hardware acceleration"
+            KVM="-enable-kvm -cpu host"
+          else
+            echo "::notice::/dev/kvm absent -> TCG emulation, boot will be slow"
+            KVM="-cpu qemu64"
+            if [ "${{ inputs.hardening }}" = "true" ]; then
+              echo "::warning title=Slow combination::KASAN + lockdep under TCG emulation is 10-30x slower. If this job hits the timeout, re-run with hardening=false to get the functional verdict first, then re-enable hardening for the sanitizer pass."
+            fi
+          fi
+
+          APPEND="console=ttyS0 panic=-1 no_timer_check"
+          if [ "${{ inputs.hardening }}" = "true" ]; then
+            APPEND="$APPEND kmemleak=on slub_debug=FZPU"
+          fi
+
+          timeout 3000 qemu-system-x86_64 \
+            -m 4G -smp 4 $KVM \
+            -nographic -no-reboot \
+            -kernel linux/arch/x86/boot/bzImage \
+            -initrd initramfs.cpio.gz \
+            -append "$APPEND" 2>&1 | tee qemu-console.log
+          echo "qemu_exit=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+
+      - name: Verdict
+        if: always()
+        run: |
+          set +e
+          if ! grep -q 'POC-TRIAGE-BEGIN' qemu-console.log 2>/dev/null; then
+            echo "::error::kernel never reached the harness - check the console log for a boot failure"
+            exit 1
+          fi
+
+          sed -n '/=====POC-TRIAGE-BEGIN=====/,/=====POC-TRIAGE-END=====/p' qemu-console.log
+
+          TD=$(sed -n 's/.*-----EXIT:tail-delta:\([0-9]*\).*/\1/p' qemu-console.log | tail -1)
+          ZL=$(sed -n 's/.*-----EXIT:zero-len:\([0-9]*\).*/\1/p'    qemu-console.log | tail -1)
+          SW=$(sed -n 's/.*-----EXIT:sweep-len0:\([0-9]*\).*/\1/p'  qemu-console.log | tail -1)
+
+          if [ "$TD" = "0" ] || [ "$ZL" = "0" ]; then V=REPRODUCED
+          elif [ "$TD" = "3" ] && [ "$ZL" = "3" ]; then V=NOT_REPRODUCED
+          else V=INCONCLUSIVE; fi
+
+          SWEEP_OK="yes"
+          [ "$SW" = "0" ] && SWEEP_OK="NO - model in TRIAGE.md 2.1 is wrong"
+
+          SANITIZERS="none"
+          grep -qE 'BUG: KASAN|Kernel panic|WARNING:|rcu:.*stall|soft lockup' qemu-console.log && \
+            SANITIZERS="REPORTS PRESENT - see console log"
+
+          {
+            echo "## qemu-mainline verdict: \`$V\`"
+            echo
+            echo "| item | value |"
+            echo "|---|---|"
+            echo "| kernel built | \`${{ inputs.kernel_version || '6.12' }}\` |"
+            echo "| hardening | ${{ inputs.hardening }} |"
+            echo "| tail-delta exit | ${TD:-?} |"
+            echo "| zero-len exit | ${ZL:-?} |"
+            echo "| sweep sqe_len=0 (must be 3) | ${SW:-?} — control passed: $SWEEP_OK |"
+            echo "| KASAN/kmemleak/lockdep output | $SANITIZERS |"
+            echo
+            echo "Interpretation: exit \`0\` = bug present on this kernel, \`3\` = absent."
+            echo "The \`sweep-len0\` control proves the reachability chain, not just the bug."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload QEMU console
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: poc-kbuf-qemu-console-${{ inputs.kernel_version || '6.12' }}
+          path: qemu-console.log
+          if-no-files-found: warn
