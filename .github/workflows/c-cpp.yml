@@ -116,12 +116,89 @@ jobs:
             fi
           done
 
-      - name: Compile (warnings are treated as defects)
+      - name: Probe uapi for IORING_REGISTER_PBUF_STATUS
+        id: probe
         run: |
-          gcc -O2 -Wall -Wextra -Werror -o poc_kbuf_triage "$POC_SRC" -luring
-          echo "compiled clean with -Wall -Wextra -Werror"
-          # also exercise the strict pass, informational only
-          gcc -O2 -Wall -Wextra -Wformat=2 -Wshadow -c "$POC_SRC" -o /tmp/strict.o || true
+          set -uo pipefail
+          # IORING_REGISTER_PBUF_STATUS is an ENUMERATOR, not a macro, so the C
+          # file cannot feature-test it with #ifndef. Extract the real value
+          # from the installed headers at build time and inject it. Never guess
+          # the number: it must match the headers the kernel was built from.
+          WORK="$(mktemp -d)"
+          cat > "$WORK/probe.c" <<'EOF'
+          #include <stdio.h>
+          #include <linux/io_uring.h>
+          int main(void) {{ printf("%d\n", IORING_REGISTER_PBUF_STATUS); return 0; }}
+          EOF
+          if gcc -x c "$WORK/probe.c" -o "$WORK/probe" 2>/dev/null; then
+            OP="$("$WORK/probe")"
+            echo "extra_cflags=-DPOC_PBUF_STATUS_OP=$OP" >> "$GITHUB_OUTPUT"
+            echo "uapi provides IORING_REGISTER_PBUF_STATUS = $OP -> head query ENABLED"
+          else
+            echo "extra_cflags=" >> "$GITHUB_OUTPUT"
+            echo "::notice::uapi headers predate v6.8: IORING_REGISTER_PBUF_STATUS absent. Head query disabled; the verdict will rely on the res-vs-capacity invariant alone, which is still sufficient."
+          fi
+          rm -rf "$WORK"
+
+      - name: Compile
+        run: |
+          set -e
+          EXTRA="${{ steps.probe.outputs.extra_cflags }}"
+          echo "extra cflags: ${EXTRA:-<none>}"
+          gcc --version | head -1
+          # The functional build must succeed. Deliberately WITHOUT -Werror:
+          # a newer gcc on a newer runner image can introduce a fresh warning,
+          # and that must never block the actual security test. Lint is a
+          # separate, non-blocking step below.
+          # shellcheck disable=SC2086
+          gcc -O2 -Wall -Wextra $EXTRA -o poc_kbuf_triage "$POC_SRC" -luring
+          echo "functional build OK"
+
+      - name: Lint (informational, non-blocking)
+        run: |
+          EXTRA="${{ steps.probe.outputs.extra_cflags }}"
+          # shellcheck disable=SC2086
+          if gcc -O2 -Wall -Wextra -Werror -Wformat=2 -Wshadow $EXTRA \
+               -c "$POC_SRC" -o /tmp/lint.o; then
+            echo "lint clean with -Werror -Wformat=2 -Wshadow"
+          else
+            echo "::warning title=Lint::this toolchain reports warnings under -Werror. The functional build above succeeded, so the test still runs - but review the warnings before submitting anything upstream."
+          fi
+
+      - name: Run CONTROL (honest ring - validates the harness itself)
+        id: control
+        run: |
+          set +e
+          # Publishes tail == ring_entries, so duplicate mapping is impossible
+          # regardless of max_len / EXPAND / nr_iovs. Must exit 3.
+          # Exit 5 == harness broken == discard every other result in this run.
+          ./poc_kbuf_triage control 2>&1 | tee control.log
+          echo "exit_code=${PIPESTATUS[0]}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Detect fix c2c185be5c85 (io_kbuf_recycle_legacy)
+        id: fixcheck
+        run: |
+          set -uo pipefail
+          # Upstream: c2c185be5c85 "io_uring/kbuf: check if target buffer list
+          # is still legacy on recycle", Cc: stable,
+          # Fixes: c7fb19428d67 (v5.19). Merged in the v7.0 window.
+          # Affected: v5.19 .. v6.x unless the distro backported it.
+          KREL="$(uname -r)"
+          FOUND=""
+          for f in /usr/share/doc/linux-image-*/changelog* \
+                   /usr/share/doc/linux-*/changelog*; do
+            [ -e "$f" ] || continue
+            case "$f" in
+              *.gz) if zgrep -qE 'c2c185be5c85|still legacy on recycle' "$f" 2>/dev/null; then FOUND="$f"; break; fi ;;
+              *)    if grep -qE 'c2c185be5c85|still legacy on recycle' "$f" 2>/dev/null; then FOUND="$f"; break; fi ;;
+            esac
+          done
+          if [ -n "$FOUND" ]; then
+            echo "status=backported ($FOUND)" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "status=NOT-FOUND-in-changelogs" | tee -a "$GITHUB_OUTPUT"
+            echo "::warning title=io_kbuf_recycle_legacy::kernel $KREL is inside the v5.19..v6.x range affected by the missing legacy/ring type check in io_kbuf_recycle_legacy() (upstream fix c2c185be5c85, Cc stable). No backport was found in the shipped changelogs. This is a separate, higher-severity issue than the buffer-accounting bug this harness tests - see TRIAGE.md 8."
+          fi
 
       - name: Run tail-delta (finding 2, UNVALIDATED_TAIL_DELTA)
         id: taildelta
@@ -137,14 +214,17 @@ jobs:
           ./poc_kbuf_triage zero-len 2>&1 | tee zero-len.log
           echo "exit_code=${PIPESTATUS[0]}" | tee -a "$GITHUB_OUTPUT"
 
-      - name: Parameter sweep (reachability-chain sanity)
+      - name: Informational sweep (sqe_len=0)
         id: sweep
         run: |
           set +e
-          # sqe->len = 0 must NOT reproduce: link 2 of the chain in TRIAGE.md 2.1.
-          # If this DOES reproduce, the model in TRIAGE.md is wrong.
-          # NOTE: PIPESTATUS must be consumed in this same step; it does not
-          # survive across steps, hence the dedicated output.
+          # INFORMATIONAL ONLY - this is NOT the control any more.
+          # It records whether sqe->len == 0 is sufficient to reach the peek
+          # path on THIS kernel. The answer is version-dependent:
+          #   master : max_len = sel->val = sr->len            -> 0 disables it
+          #   v6.17  : max_len = min_not_zero(sr->len, msg_inq) -> 0 does NOT
+          # A result of 0 here means the trigger surface is wider than the
+          # master-derived model claimed. It does not invalidate anything.
           ./poc_kbuf_triage tail-delta 0 2>&1 | tee sweep-len0.log
           echo "exit_code=${PIPESTATUS[0]}" | tee -a "$GITHUB_OUTPUT"
 
@@ -152,11 +232,19 @@ jobs:
         id: classify
         run: |
           BUNDLE="${{ steps.env.outputs.has_bundle }}"
+          CT="${{ steps.control.outputs.exit_code }}"
           TD="${{ steps.taildelta.outputs.exit_code }}"
           ZL="${{ steps.zerolen.outputs.exit_code }}"
           SW="${{ steps.sweep.outputs.exit_code }}"
+          FX="${{ steps.fixcheck.outputs.status }}"
 
-          if [ "$BUNDLE" != "1" ]; then
+          # The control gates everything: if the harness reports a violation on
+          # an honest ring, the build or the verdict logic is broken.
+          if [ "$CT" = "5" ]; then
+            VERDICT="HARNESS_BROKEN"
+          elif [ "$CT" != "3" ]; then
+            VERDICT="CONTROL_DID_NOT_PASS"
+          elif [ "$BUNDLE" != "1" ]; then
             VERDICT="INCONCLUSIVE_KERNEL_TOO_OLD"
           elif [ "$TD" = "0" ] || [ "$ZL" = "0" ]; then
             VERDICT="REPRODUCED"
@@ -169,29 +257,35 @@ jobs:
           fi
           echo "verdict=$VERDICT" | tee -a "$GITHUB_OUTPUT"
 
-          # The sweep is a CONTROL, not a variant: with sqe->len=0 the peek path
-          # must collapse to a single iovec and NOT reproduce. If it does
-          # reproduce, our understanding of the reachability chain is wrong and
-          # every other result in this run is untrustworthy.
-          if [ "$BUNDLE" = "1" ] && [ "$SW" = "0" ]; then
-            echo "::error title=Control failed::sqe_len=0 reproduced the bug (exit 0). The reachability model in TRIAGE.md 2.1 is wrong; do not trust the other verdicts in this run."
-          fi
-
           {
-            echo "## poc-kbuf-triage: \`$VERDICT\`"
+            echo "## poc-kbuf-triage: `$VERDICT`"
             echo
             echo "| item | value |"
             echo "|---|---|"
-            echo "| runner kernel | \`${{ steps.env.outputs.kernel_release }}\` |"
-            echo "| >= 6.10 (bundle support) | $([ "$BUNDLE" = "1" ] && echo yes || echo '**NO — result inconclusive**') |"
+            echo "| runner kernel | `${{ steps.env.outputs.kernel_release }}` |"
+            echo "| >= 6.10 (bundle support) | $([ "$BUNDLE" = "1" ] && echo yes || echo '**NO - inconclusive**') |"
+            echo "| **control (honest ring, must be 3)** | **$CT** |"
             echo "| tail-delta exit | $TD |"
             echo "| zero-len exit | $ZL |"
-            echo "| control (sqe_len=0, must be 3) | $SW |"
+            echo "| informational sweep sqe_len=0 | $SW |"
+            echo "| fix c2c185be5c85 in changelogs | $FX |"
             echo
-            echo "Exit codes: \`0\`=reproduced, \`3\`=not reproduced, \`4\`=inconclusive, \`1/2\`=env error."
+            echo "Exit codes: `0`=reproduced, `3`=not reproduced / control passed,"
+            echo "`4`=inconclusive (head unavailable), `5`=**control failed, harness"
+            echo "broken**, `1/2`=environment error."
             echo
-            echo "> A \`NOT_REPRODUCED\` on a kernel < 6.10 means nothing. Run the"
-            echo "> \`qemu-mainline\` job for an authoritative answer."
+            echo "The control is read FIRST. `HARNESS_BROKEN` or"
+            echo "`CONTROL_DID_NOT_PASS` invalidates every other number in this"
+            echo "table, including a `REPRODUCED`."
+            echo
+            echo "Interpretation notes:"
+            echo "- `zero-len exit 4` means the head query failed, NOT that the"
+            echo "  finding is absent; check the PBUF_STATUS error line in"
+            echo "  zero-len.log."
+            echo "- `sweep sqe_len=0` is informational and kernel-version"
+            echo "  dependent: `0` here means the trigger surface is wider than"
+            echo "  the master-derived model assumed (v6.17 uses"
+            echo "  `min_not_zero(sr->len, msg_inq)`)."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload logs
@@ -200,6 +294,7 @@ jobs:
         with:
           name: poc-kbuf-logs-runner
           path: |
+            control.log
             tail-delta.log
             zero-len.log
             sweep-len0.log
@@ -283,10 +378,37 @@ jobs:
           make -j"$(nproc)" bzImage 2>&1 | tail -25
           ls -la arch/x86/boot/bzImage
 
+      - name: Probe uapi for IORING_REGISTER_PBUF_STATUS
+        id: probe_qemu
+        run: |
+          set -uo pipefail
+          # IORING_REGISTER_PBUF_STATUS is an ENUMERATOR, not a macro, so the C
+          # file cannot feature-test it with #ifndef. Extract the real value
+          # from the installed headers at build time and inject it. Never guess
+          # the number: it must match the headers the kernel was built from.
+          WORK="$(mktemp -d)"
+          cat > "$WORK/probe.c" <<'EOF'
+          #include <stdio.h>
+          #include <linux/io_uring.h>
+          int main(void) {{ printf("%d\n", IORING_REGISTER_PBUF_STATUS); return 0; }}
+          EOF
+          if gcc -x c "$WORK/probe.c" -o "$WORK/probe" 2>/dev/null; then
+            OP="$("$WORK/probe")"
+            echo "extra_cflags=-DPOC_PBUF_STATUS_OP=$OP" >> "$GITHUB_OUTPUT"
+            echo "uapi provides IORING_REGISTER_PBUF_STATUS = $OP -> head query ENABLED"
+          else
+            echo "extra_cflags=" >> "$GITHUB_OUTPUT"
+            echo "::notice::uapi headers predate v6.8: IORING_REGISTER_PBUF_STATUS absent. Head query disabled; the verdict will rely on the res-vs-capacity invariant alone, which is still sufficient."
+          fi
+          rm -rf "$WORK"
+
       - name: Build PoC statically
         run: |
           set -e
-          gcc -O2 -Wall -Wextra -static -o poc_static "$POC_SRC" -luring
+          EXTRA="${{ steps.probe_qemu.outputs.extra_cflags }}"
+          echo "extra cflags: ${EXTRA:-<none>}"
+          # shellcheck disable=SC2086
+          gcc -O2 -Wall -Wextra -static $EXTRA -o poc_static "$POC_SRC" -luring
           file poc_static
           ldd poc_static 2>&1 | head -3 || true   # expected: "not a dynamic executable"
 
